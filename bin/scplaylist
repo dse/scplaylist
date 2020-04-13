@@ -1,0 +1,257 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+
+use File::Basename qw(basename);
+our $PROGNAME = basename($0);
+
+use Getopt::Long qw();
+
+our $archive = 0;
+our $test = 0;
+our $verbose = 0;
+our $cleanup = 0;
+
+Getopt::Long::Configure('bundling', 'gnu_compat', 'no_ignore_case');
+Getopt::Long::GetOptions(
+    't|test'     => \$test,
+    'a|archive'  => \$archive,
+    'v|verbose+' => \$verbose,
+    'cleanup'    => \$cleanup,
+    'h|help'     => sub { usage(); exit(0); },
+);
+
+sub usage { print(<<"END"); }
+usage: $PROGNAME [<option> ...] <station-name> <url>
+options:
+    -a, --archive
+    -t, --test
+    -v, --verbose
+    -h, --help
+END
+
+if (scalar @ARGV < 2) {
+    die("$PROGNAME: must supply <station-name> and <url>\n");
+}
+
+my ($stationName, $stationURL) = @ARGV;
+
+my $archiver = My::SHOUTcast::Playlist::Archiver->new();
+$archiver->setStation($stationName, $stationURL);
+$archiver->isTesting(1) if $test;
+$archiver->isArchiving(1) if $archive;
+$archiver->verbose($verbose) if $verbose;
+if ($cleanup) {
+    $archiver->cleanup();
+} else {
+    $archiver->run();
+}
+
+package My::SHOUTcast::Playlist::Archiver {
+    use File::Basename qw(basename);
+    our $PROGNAME; BEGIN { $PROGNAME = basename($0); }
+
+    use feature               qw(say);
+    use File::Basename        qw(dirname);
+    use LWP::UserAgent        qw();
+    use HTML::Tree            qw();
+    use File::Path            qw(make_path);
+    use POSIX                 qw(strftime tzset);
+    use Time::ParseDate       qw(parsedate);
+    use File::Spec::Functions qw(abs2rel);
+    use Data::Dumper          qw(Dumper);
+
+    use Moo;
+    INIT {
+        has 'ua'          => (is => 'rw', lazy => 1, default => sub { return LWP::UserAgent->new(); });
+        has 'stationName' => (is => 'rw');
+        has 'stationURL'  => (is => 'rw');
+        has 'isTesting'   => (is => 'rw', default => 0);
+        has 'isArchiving' => (is => 'rw', default => 0);
+        has 'verbose'     => (is => 'rw', default => 0);
+    }
+
+    sub run {
+        my ($self) = @_;
+        my @data = $self->getLiveData();
+        if ($self->isArchiving) {
+            my $latestTimestamp;
+            my @latest = $self->getLatestData();
+            if (scalar @latest) {
+                if ($self->verbose >= 2) {
+                    say STDERR Dumper \@latest;
+                }
+                $latestTimestamp = $latest[0]->{timestamp};
+                if ($self->verbose >= 2) {
+                    warn("$PROGNAME: latest timestamp is now $latestTimestamp\n");
+                }
+            }
+            $self->printData(data => \@data, latestTimestamp => $latestTimestamp);
+        } else {
+            $self->printData(data => \@data);
+        }
+    }
+
+    sub getLiveData {
+        my ($self) = @_;
+        my $response = $self->ua->get($self->stationURL);
+        return unless $response->is_success;
+        my $tree = HTML::TreeBuilder->new();
+        $tree->parse($response->decoded_content);
+        $tree->eof();
+        my @tr = $tree->look_down('_tag', 'tr');
+        my @result;
+        foreach my $tr (@tr) {
+            my @td = $tr->content_list();
+            my @text = map { $_->as_text_trimmed() } @td;
+            next unless $text[0] =~ m{^\d+:\d+:\d+$};
+            my $time_t = $self->parseNearestTime($text[0]);
+            my $fmt = strftime('%a %Y-%m-%d %H:%M:%S %z %Z', localtime($time_t));
+            my $isCurrentSong = defined $text[2] && lc($text[2]) eq 'current song';
+            my @line = ($time_t, $fmt, @text);
+            push(@result, {
+                timestamp          => $time_t,
+                timestampFormatted => $fmt,
+                song               => $text[1],
+                isCurrentSong      => $isCurrentSong,
+                line               => \@line
+            });
+        }
+        return @result;
+    }
+
+    sub getLatestData {
+        my ($self) = @_;
+        my $filename = $self->latestFilename;
+        my $fh;
+        if (!open($fh, '<', $filename)) {
+            warn("$PROGNAME: cannot read $filename: $!\n") if $self->verbose;
+            return;
+        }
+        my @result;
+        while (<$fh>) {
+            s{\R\z}{};
+            s{^\#L\#\s*}{};
+            my @data = split("\t");
+            push(@result, {
+                timestamp          => $data[0],
+                timestampFormatted => $data[1],
+                song               => $data[3],
+                isCurrentSong      => (defined $data[4] && lc($data[4]) eq 'current song'),
+                line               => \@data,
+            });
+        }
+        return @result;
+    }
+
+    sub parseNearestTime {
+        my ($self, $time) = @_;
+        my $time_t_now = time();
+        my $time_t_1 = parsedate("yesterday $time", NOW => $time_t_now);
+        my $time_t_2 = parsedate("today     $time", NOW => $time_t_now);
+        my $time_t_3 = parsedate("tomorrow  $time", NOW => $time_t_now);
+        my $diff_1 = abs($time_t_now - $time_t_1);
+        my $diff_2 = abs($time_t_now - $time_t_2);
+        my $diff_3 = abs($time_t_now - $time_t_3);
+        my ($diff_closest) = sort { $a <=> $b } ($diff_1, $diff_2, $diff_3);
+        return $time_t_1 if $diff_closest == $diff_1;
+        return $time_t_2 if $diff_closest == $diff_2;
+        return $time_t_3 if $diff_closest == $diff_3;
+        die("$PROGNAME: UNEXPECTED: parseNearestTime\n");
+    }
+
+    sub printData {
+        my ($self, %args) = @_;
+        my @data = eval { @{$args{data}} };
+
+        my $latestTimestamp = $args{latestTimestamp};
+        if (defined $latestTimestamp) {
+            if ($self->verbose >= 2) {
+                warn("$PROGNAME: latest timestamp is $latestTimestamp\n");
+                say STDERR Dumper \@data;
+            }
+            @data = grep { $_->{timestamp} > $latestTimestamp } @data;
+        }
+
+        if (!scalar @data) {
+            warn("$PROGNAME: nothing new to report since previous run\n");
+            return;
+        }
+
+        foreach my $data (@data) {
+            say join("\t", @{$data->{line}});
+        }
+
+        if ($self->isArchiving) {
+            my $filename = $self->dataFilename();
+            my $fh;
+            make_path(dirname($filename));
+            if (!open($fh, '>', $filename)) {
+                die("$PROGNAME: cannot write $filename: $!\n");
+            }
+            foreach my $data (@data) {
+                say $fh join("\t", @{$data->{line}});
+            }
+            close($fh);
+            warn("$PROGNAME: wrote $filename\n") if $self->verbose;
+            $self->updateLatestLink($filename);
+        }
+    }
+
+    sub baseDir {
+        my ($self) = @_;
+        my $stationName = $self->stationName;
+        return "$ENV{HOME}/.shoutcast-archive-test/$stationName" if $self->isTesting;
+        return "$ENV{HOME}/.shoutcast-archive/$stationName";
+    }
+
+    sub setStation {
+        my ($self, $name, $url) = @_;
+        if ($stationURL =~ m{://}) {
+            # do nothing
+        } elsif ($stationName =~ m{://}) {
+            ($name, $url) = ($url, $name);
+        } else {
+            die("$PROGNAME: must supply <station-name> and a valid <url>\n");
+        }
+        $self->stationName($name);
+        $self->stationURL($url);
+        warn("$PROGNAME: station name is $name\n") if $self->verbose;
+        warn("$PROGNAME: station URL is $url\n") if $self->verbose;
+    }
+
+    sub dataFilename {
+        my ($self) = @_;
+        my $baseDir = $self->baseDir;
+        my $filename;
+        my $counter = 0;
+        do {
+            $filename = strftime("$baseDir/%Y/%m/%d/%H/%s-%H%M%S%z.tsv", localtime());
+            $filename =~ s{(\.[0-9A-Za-z]+)$}{-$counter$1};
+            $counter += 1;
+        } until ! -e $filename;
+        return $filename;
+    }
+
+    sub latestFilename {
+        my ($self) = @_;
+        return $self->baseDir . '/latest';
+    }
+
+    sub updateLatestLink {
+        my ($self, $filename) = @_;
+        my $latestLink = $self->latestFilename;
+        my $dest = abs2rel($filename, dirname($latestLink));
+        if (!symlink($dest, $latestLink)) {
+            if ($!{EEXIST}) {
+                unlink($latestLink);
+                if (!symlink($dest, $latestLink)) {
+                    warn("$PROGNAME: cannot symlink $latestLink to $dest: $!\n");
+                }
+            } else {
+                warn("$PROGNAME: cannot symlink $latestLink to $dest: $!\n");
+            }
+        }
+        system("/bin/ls -l $latestLink >&2") if $self->verbose >= 2;
+    }
+};
