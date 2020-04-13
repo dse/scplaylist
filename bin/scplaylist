@@ -10,19 +10,18 @@ use Getopt::Long qw();
 our $archive = 0;
 our $test = 0;
 our $verbose = 0;
-our $cleanup = 0;
 
 Getopt::Long::Configure('bundling', 'gnu_compat', 'no_ignore_case');
 Getopt::Long::GetOptions(
     't|test'     => \$test,
     'a|archive'  => \$archive,
     'v|verbose+' => \$verbose,
-    'cleanup'    => \$cleanup,
     'h|help'     => sub { usage(); exit(0); },
 );
 
 sub usage { print(<<"END"); }
-usage: $PROGNAME [<option> ...] <station-name> <url>
+usage: $PROGNAME [<option> ...] <stream-url>
+usage: $PROGNAME [<option> ...] --archive <station-name> <stream-url>
 options:
     -a, --archive
     -t, --test
@@ -30,22 +29,14 @@ options:
     -h, --help
 END
 
-if (scalar @ARGV < 2) {
-    die("$PROGNAME: must supply <station-name> and <url>\n");
-}
-
 my ($stationName, $stationURL) = @ARGV;
 
 my $archiver = My::SHOUTcast::Playlist::Archiver->new();
-$archiver->setStation($stationName, $stationURL);
 $archiver->isTesting(1) if $test;
 $archiver->isArchiving(1) if $archive;
 $archiver->verbose($verbose) if $verbose;
-if ($cleanup) {
-    $archiver->cleanup();
-} else {
-    $archiver->run();
-}
+$archiver->setStation($stationName, $stationURL);
+$archiver->run();
 
 package My::SHOUTcast::Playlist::Archiver {
     use File::Basename qw(basename);
@@ -206,18 +197,25 @@ package My::SHOUTcast::Playlist::Archiver {
     }
 
     sub setStation {
-        my ($self, $name, $url) = @_;
-        if ($stationURL =~ m{://}) {
-            # do nothing
-        } elsif ($stationName =~ m{://}) {
-            ($name, $url) = ($url, $name);
-        } else {
-            die("$PROGNAME: must supply <station-name> and a valid <url>\n");
+        my ($self, @args) = @_;
+        my ($url)  = grep { defined $_ && m{://}  } @args;
+        my ($name) = grep { defined $_ && !m{://} } @args;
+        if (defined $url) {
+            $self->stationURL($url);
         }
-        $self->stationName($name);
-        $self->stationURL($url);
-        warn("$PROGNAME: station name is $name\n") if $self->verbose;
-        warn("$PROGNAME: station URL is $url\n") if $self->verbose;
+        if (defined $name) {
+            $self->stationName($name);
+        }
+        if ($self->verbose) {
+            warn(sprintf("$PROGNAME: station name is %s\n", $name // '<undef>'));
+            warn(sprintf("$PROGNAME: station URL is %s\n", $url // '<undef>'));
+        }
+        if (!defined $url) {
+            die("$PROGNAME: must supply station URL\n");
+        }
+        if ($self->isArchiving && !defined $name) {
+            die("$PROGNAME: must supply station name when archiving\n");
+        }
     }
 
     sub dataFilename {
