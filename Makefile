@@ -1,5 +1,5 @@
 simpletest:
-	TZ='America/Detroit' bin/scplaylist --test metal-nation-radio 'http://198.100.145.185:8900/played.html?sid=1'
+	TZ='America/Detroit' bin/scplaylist --test 'http://198.100.145.185:8900/played.html?sid=1'
 test:
 	TZ='America/Detroit' bin/scplaylist --test --archive metal-nation-radio 'http://198.100.145.185:8900/played.html?sid=1'
 	TZ='America/Detroit' bin/scplaylist --test --archive 'http://198.100.145.185:8900/played.html?sid=1' metal-nation-radio
