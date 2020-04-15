@@ -192,8 +192,10 @@ package My::SHOUTcast::Playlist::Archiver {
     sub baseDir {
         my ($self) = @_;
         my $stationName = $self->stationName;
-        return "$ENV{HOME}/.shoutcast-archive-test/$stationName" if $self->isTesting;
-        return "$ENV{HOME}/.shoutcast-archive/$stationName";
+        if ($self->isTesting) {
+            return "$ENV{HOME}/.scplaylist-test/$stationName";
+        }
+        return "$ENV{HOME}/.scplaylist/$stationName";
     }
 
     sub setStation {
